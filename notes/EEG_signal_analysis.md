@@ -1,4 +1,4 @@
-# analysis-temp
+# analysis
 
 ## Signal characteristics analysis
 
@@ -15,4 +15,3 @@
 - 多导联：多导联之间存在空间相关性
     - 卷积核需要考虑空间相关性
     - 多导联之间的空间相关性在PID分析当中属于冗余信息
-- 
