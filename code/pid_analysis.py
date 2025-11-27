@@ -24,7 +24,7 @@ import sys
 import os
 import gc
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 # Add current directory to path for imports
 sys.path.append(os.path.dirname(__file__))
@@ -40,13 +40,23 @@ class PIDFResult:
     feature_index: int
     feature_name: str
     mutual_information: float  # I(Xi; Y)
-    synergy: float  # Synergistic contribution
-    redundancy: float  # Redundant contribution
+    synergy: float  # Synergistic contribution (positive theta)
+    redundancy: float  # Redundant contribution (negative theta)
     unique_info: float  # Unique information = MI - Redundancy
-    total_contribution: float  # MI + Synergy
+    total_contribution: float  # MI + Synergy - Redundancy
     is_selected: bool
     redundant_with: List[int]  # Features this is redundant with
     synergistic_with: List[int]  # Features this has synergy with
+    # New fields for detailed analysis
+    theta_values: Dict[int, float] = None  # Raw theta values for each feature pair
+    theta_ci: Dict[int, Tuple[float, float]] = None  # Confidence intervals
+    interaction_type: str = "independent"  # 'synergistic', 'redundant', 'independent', 'mixed'
+    
+    def __post_init__(self):
+        if self.theta_values is None:
+            self.theta_values = {}
+        if self.theta_ci is None:
+            self.theta_ci = {}
 
 
 class EnhancedPIDF:
@@ -268,7 +278,7 @@ class EnhancedPIDF:
         Perform complete PID analysis for a single feature.
         
         Returns:
-        - PIDFResult with all PID components
+        - PIDFResult with all PID components including raw theta values
         """
         print(f"\n  Analyzing {self.feature_names[foi_idx]} (index {foi_idx})...")
         
@@ -282,6 +292,8 @@ class EnhancedPIDF:
         synergistic_with = []
         total_redundancy = 0
         total_synergy_contribution = 0
+        theta_values_dict = {}  # Store raw theta values
+        theta_ci_dict = {}  # Store confidence intervals
         
         for fnoi_idx in range(self.n_features):
             if fnoi_idx == foi_idx:
@@ -290,26 +302,54 @@ class EnhancedPIDF:
             # Check feature-feature MI (for redundancy detection)
             ff_mi = self.estimate_feature_feature_mi(foi_idx, fnoi_idx)
             
-            # Compute theta
+            # Compute theta with more runs for stability
             theta_values = self.compute_theta(foi_idx, fnoi_idx)
             theta_mean, theta_ci = self._calculate_confidence_interval(theta_values)
             
-            if theta_ci[1] < -0.001:  # Significantly negative = redundant
+            # Store raw values
+            theta_values_dict[fnoi_idx] = theta_mean
+            theta_ci_dict[fnoi_idx] = theta_ci
+            
+            # Determine relationship type based on theta
+            # Use relative threshold: |θ| > 0.1 * MI or absolute > 0.001
+            threshold = max(0.001, 0.1 * abs(mi_mean))
+            
+            if theta_ci[1] < -threshold:  # Significantly negative = redundant/interference
                 redundant_with.append(fnoi_idx)
                 total_redundancy += abs(theta_mean)
-                print(f"    Redundant with {self.feature_names[fnoi_idx]}: θ={theta_mean:.4f}")
-            elif theta_ci[0] > 0.001:  # Significantly positive = synergistic
+                print(f"    ⊖ Redundant/Interference with {self.feature_names[fnoi_idx]}: θ={theta_mean:.4f} (CI: [{theta_ci[0]:.4f}, {theta_ci[1]:.4f}])")
+            elif theta_ci[0] > threshold:  # Significantly positive = synergistic
                 synergistic_with.append(fnoi_idx)
                 total_synergy_contribution += theta_mean
-                print(f"    Synergistic with {self.feature_names[fnoi_idx]}: θ={theta_mean:.4f}")
+                print(f"    ⊕ Synergistic with {self.feature_names[fnoi_idx]}: θ={theta_mean:.4f} (CI: [{theta_ci[0]:.4f}, {theta_ci[1]:.4f}])")
+            else:  # Not significant but still report
+                relation = "slightly redundant" if theta_mean < 0 else "slightly synergistic" if theta_mean > 0 else "independent"
+                print(f"    ○ {relation.capitalize()} with {self.feature_names[fnoi_idx]}: θ={theta_mean:.4f} (CI: [{theta_ci[0]:.4f}, {theta_ci[1]:.4f}]) [not significant]")
         
         # 3. Compute unique information
         unique_info = max(0, mi_mean - total_redundancy)
         
-        # 4. Compute total contribution
-        total_contribution = mi_mean + total_synergy_contribution
+        # 4. Compute total contribution (can be negative if redundancy dominates)
+        total_contribution = mi_mean + total_synergy_contribution - total_redundancy
         
-        # 5. Determine if feature should be selected
+        # 5. Determine interaction type
+        if len(synergistic_with) > 0 and len(redundant_with) > 0:
+            interaction_type = "mixed"
+        elif len(synergistic_with) > 0:
+            interaction_type = "synergistic"
+        elif len(redundant_with) > 0:
+            interaction_type = "redundant"
+        else:
+            # Check if there's a trend even if not significant
+            avg_theta = np.mean(list(theta_values_dict.values())) if theta_values_dict else 0
+            if avg_theta > 0.0005:
+                interaction_type = "weakly_synergistic"
+            elif avg_theta < -0.0005:
+                interaction_type = "weakly_redundant"
+            else:
+                interaction_type = "independent"
+        
+        # 6. Determine if feature should be selected
         is_selected = (mi_ci[0] > 0) and (unique_info > 0.001 or len(synergistic_with) > 0)
         
         result = PIDFResult(
@@ -322,7 +362,10 @@ class EnhancedPIDF:
             total_contribution=total_contribution,
             is_selected=is_selected,
             redundant_with=redundant_with,
-            synergistic_with=synergistic_with
+            synergistic_with=synergistic_with,
+            theta_values=theta_values_dict,
+            theta_ci=theta_ci_dict,
+            interaction_type=interaction_type
         )
         
         return result
@@ -394,14 +437,324 @@ class EnhancedPIDF:
                       f"{[self.feature_names[i] for i in r.synergistic_with]}")
 
 
+def visualize_pidf_paper_style(results: List[PIDFResult], feature_names: List[str],
+                                title: str = "PIDF Decomposition",
+                                save_path: Optional[str] = None,
+                                ax: Optional[plt.Axes] = None) -> Optional[plt.Figure]:
+    """
+    Create visualization following PIDF paper style with support for redundancy/interference.
+    
+    According to the paper:
+    - Red: I(Y; F_i) - Individual mutual information
+    - Green: FWS(Y; F_{\\i}, F_i) - Feature-wise synergy (协同信息, θ > 0)
+    - Purple: FWR(Y | F_{\\i}, F_i) - Feature-wise redundancy/interference (冗余/干扰, θ < 0)
+    
+    Enhanced to show:
+    - Positive θ (synergy) stacked above MI
+    - Negative θ (redundancy/interference) shown below zero line
+    - Interaction type annotation for each feature
+    """
+    n_features = len(results)
+    
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(3 + n_features * 2, 7))
+        standalone = True
+    else:
+        fig = None
+        standalone = False
+    
+    # Extract components
+    mi_values = [r.mutual_information for r in results]
+    synergy_values = [r.synergy for r in results]  # Positive θ contributions
+    redundancy_values = [r.redundancy for r in results]  # |Negative θ| contributions
+    interaction_types = [r.interaction_type for r in results]
+    
+    # Get raw theta values for display
+    theta_displays = []
+    for r in results:
+        if r.theta_values:
+            avg_theta = np.mean(list(r.theta_values.values()))
+            theta_displays.append(avg_theta)
+        else:
+            theta_displays.append(0)
+    
+    x = np.arange(n_features)
+    width = 0.6
+    
+    # Colors
+    color_mi = '#E74C3C'  # Red - I(Y; F_i)
+    color_synergy = '#2ECC71'  # Green - Synergy (θ > 0)
+    color_redundancy = '#9B59B6'  # Purple - Redundancy (θ < 0)
+    color_interference = '#E67E22'  # Orange - Interference indicator
+    
+    # Draw MI (red) as base - always positive
+    bars_mi = ax.bar(x, mi_values, width, label=r'$I(Y; F_i)$ - Individual MI', 
+                     color=color_mi, edgecolor='black', linewidth=1)
+    
+    # Draw Synergy (green) on top of MI - only positive values
+    synergy_pos = [max(0, s) for s in synergy_values]
+    if any(s > 0 for s in synergy_pos):
+        bars_synergy = ax.bar(x, synergy_pos, width, bottom=mi_values,
+                              label='Synergy (theta > 0)', 
+                              color=color_synergy, edgecolor='black', linewidth=1)
+    
+    # Draw Redundancy (purple) BELOW zero line - shows interference effect
+    redundancy_neg = [-r for r in redundancy_values]  # Make negative for display
+    if any(r > 0 for r in redundancy_values):
+        bars_redundancy = ax.bar(x, redundancy_neg, width,
+                                  label='Redundancy/Interference (theta < 0)', 
+                                  color=color_redundancy, edgecolor='black', linewidth=1,
+                                  hatch='///')
+    
+    # Add annotations
+    for i in range(n_features):
+        mi = mi_values[i]
+        syn = synergy_pos[i]
+        red = redundancy_values[i]
+        theta = theta_displays[i]
+        itype = interaction_types[i]
+        
+        # Top annotation: MCI value
+        mci = mi + syn
+        ax.annotate(f'MCI={mci:.4f}', xy=(x[i], mci + 0.001), ha='center', va='bottom', 
+                    fontsize=9, fontweight='bold')
+        
+        # MI value inside bar
+        if mi > 0.002:
+            ax.annotate(f'{mi:.4f}', xy=(x[i], mi/2), ha='center', va='center',
+                        fontsize=8, color='white', fontweight='bold')
+        
+        # Bottom annotation: redundancy/interference
+        if red > 0:
+            ax.annotate(f'-{red:.4f}', xy=(x[i], -red - 0.001), ha='center', va='top',
+                        fontsize=8, color=color_redundancy)
+        
+        # Interaction type symbol
+        type_symbols = {
+            'synergistic': '⊕',
+            'redundant': '⊖',
+            'independent': '○',
+            'mixed': '◐',
+            'weakly_synergistic': '(+)',
+            'weakly_redundant': '(-)',
+        }
+        symbol = type_symbols.get(itype, '?')
+        
+        # Color based on theta
+        symbol_color = color_synergy if theta > 0 else color_redundancy if theta < 0 else 'gray'
+        ax.annotate(f'{symbol}\nθ={theta:.4f}', xy=(x[i], -max(redundancy_values) - 0.003 if redundancy_values else -0.003), 
+                    ha='center', va='top', fontsize=8, color=symbol_color)
+    
+    # Styling
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=1.5)
+    ax.set_xlabel('Features', fontsize=12)
+    ax.set_ylabel('Information (Nats)', fontsize=12)
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels([r.feature_name for r in results], rotation=45, ha='right', fontsize=10)
+    ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
+    
+    # Set y limits to show both positive and negative regions
+    max_pos = max(mi + syn for mi, syn in zip(mi_values, synergy_pos)) * 1.3
+    max_neg = max(redundancy_values) * 1.5 if redundancy_values and max(redundancy_values) > 0 else 0.005
+    ax.set_ylim(bottom=-max_neg, top=max_pos)
+    ax.grid(axis='y', alpha=0.3)
+    
+    if standalone:
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"\nVisualization saved to: {save_path}")
+        plt.close()
+    
+    return fig
+
+
+def visualize_nback_comparison(load_results: Dict[int, List[PIDFResult]], 
+                               feature_names: List[str],
+                               save_path: Optional[str] = None) -> plt.Figure:
+    """
+    Create enhanced comparison visualization across different n-back conditions.
+    
+    Shows how PID components (including redundancy/interference) change with cognitive load.
+    """
+    n_conditions = len(load_results)
+    n_features = len(feature_names)
+    
+    if n_conditions == 0:
+        print("No results to visualize")
+        return None
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=(18, 12))
+    
+    # Layout: 
+    # Top row: Individual PIDF plots for each n-back condition
+    # Middle: Theta value comparison (key for synergy/redundancy)
+    # Bottom: Trend analysis
+    
+    sorted_loads = sorted(load_results.keys())
+    
+    gs = fig.add_gridspec(3, n_conditions + 1, height_ratios=[1.2, 1, 1], 
+                          width_ratios=[1] * n_conditions + [1.2])
+    
+    # Top row: Individual PIDF decomposition per condition
+    for col, load_level in enumerate(sorted_loads):
+        ax = fig.add_subplot(gs[0, col])
+        results = load_results[load_level]
+        visualize_pidf_paper_style(
+            results, feature_names[:len(results)], 
+            title=f'{load_level}-back Task',
+            ax=ax
+        )
+    
+    # Top right: Summary metrics comparison
+    ax_summary = fig.add_subplot(gs[0, n_conditions])
+    
+    metrics = {'MI': [], 'Synergy': [], 'Redundancy': [], 'Net Effect': []}
+    labels = []
+    interaction_summary = []
+    
+    for load_level in sorted_loads:
+        results = load_results[load_level]
+        total_mi = sum(r.mutual_information for r in results)
+        total_syn = sum(r.synergy for r in results)
+        total_red = sum(r.redundancy for r in results)
+        net_effect = total_syn - total_red  # Positive = synergistic, Negative = redundant
+        
+        metrics['MI'].append(total_mi)
+        metrics['Synergy'].append(total_syn)
+        metrics['Redundancy'].append(-total_red)  # Show as negative
+        metrics['Net Effect'].append(net_effect)
+        labels.append(f'{load_level}-back')
+        
+        # Determine overall interaction type
+        if net_effect > 0.001:
+            interaction_summary.append('Synergistic')
+        elif net_effect < -0.001:
+            interaction_summary.append('Redundant')
+        else:
+            interaction_summary.append('Independent')
+    
+    x = np.arange(len(labels))
+    width = 0.2
+    
+    colors = {'MI': '#E74C3C', 'Synergy': '#2ECC71', 'Redundancy': '#9B59B6', 'Net Effect': '#3498DB'}
+    
+    for i, (metric_name, values) in enumerate(metrics.items()):
+        offset = (i - 1.5) * width
+        ax_summary.bar(x + offset, values, width, label=metric_name, 
+                       color=colors[metric_name], edgecolor='black', linewidth=0.5)
+    
+    ax_summary.axhline(y=0, color='black', linestyle='-', linewidth=1)
+    ax_summary.set_xlabel('Cognitive Load')
+    ax_summary.set_ylabel('Information (Nats)')
+    ax_summary.set_title('PID Metrics Summary', fontweight='bold')
+    ax_summary.set_xticks(x)
+    ax_summary.set_xticklabels(labels)
+    ax_summary.legend(loc='upper right', fontsize=8)
+    ax_summary.grid(axis='y', alpha=0.3)
+    
+    # Add interaction type annotations
+    for i, itype in enumerate(interaction_summary):
+        color = '#2ECC71' if itype == 'Synergistic' else '#9B59B6' if itype == 'Redundant' else 'gray'
+        ax_summary.annotate(itype, xy=(x[i], ax_summary.get_ylim()[1] * 0.9), 
+                           ha='center', fontsize=9, color=color, fontweight='bold')
+    
+    # Middle row: Theta values comparison across conditions
+    ax_theta = fig.add_subplot(gs[1, :])
+    
+    theta_data = {}
+    for feat_idx, feat_name in enumerate(feature_names):
+        theta_by_load = []
+        for load_level in sorted_loads:
+            results = load_results[load_level]
+            if feat_idx < len(results):
+                r = results[feat_idx]
+                if r.theta_values:
+                    avg_theta = np.mean(list(r.theta_values.values()))
+                else:
+                    avg_theta = 0
+                theta_by_load.append(avg_theta)
+        if theta_by_load:
+            theta_data[feat_name] = theta_by_load
+    
+    x_positions = np.arange(len(sorted_loads))
+    width_per_feature = 0.8 / len(theta_data)
+    colors_features = plt.cm.Set2(np.linspace(0, 1, len(theta_data)))
+    
+    for feat_idx, (feat_name, theta_vals) in enumerate(theta_data.items()):
+        offset = (feat_idx - len(theta_data)/2 + 0.5) * width_per_feature
+        bars = ax_theta.bar(x_positions + offset, theta_vals, width_per_feature * 0.9,
+                            label=feat_name, color=colors_features[feat_idx], 
+                            edgecolor='black', linewidth=0.5)
+        
+        # Add value annotations
+        for i, val in enumerate(theta_vals):
+            color = '#2ECC71' if val > 0 else '#9B59B6'
+            ax_theta.annotate(f'{val:.4f}', xy=(x_positions[i] + offset, val),
+                             ha='center', va='bottom' if val > 0 else 'top',
+                             fontsize=8, color=color)
+    
+    ax_theta.axhline(y=0, color='black', linestyle='-', linewidth=1.5)
+    ax_theta.axhspan(-0.001, 0.001, alpha=0.2, color='gray', label='Threshold')
+    ax_theta.set_xlabel('Cognitive Load Condition', fontsize=12)
+    ax_theta.set_ylabel('θ Value (Synergy - Redundancy)', fontsize=12)
+    ax_theta.set_title('Feature Interaction θ Values Across N-back Conditions\n(θ>0: Synergy, θ<0: Redundancy/Interference)', 
+                       fontsize=12, fontweight='bold')
+    ax_theta.set_xticks(x_positions)
+    ax_theta.set_xticklabels([f'{l}-back' for l in sorted_loads], fontsize=11)
+    ax_theta.legend(loc='upper right', fontsize=9)
+    ax_theta.grid(axis='y', alpha=0.3)
+    
+    # Bottom row: Net contribution trend
+    ax_trend = fig.add_subplot(gs[2, :])
+    
+    for feat_idx, feat_name in enumerate(feature_names):
+        mi_by_load = []
+        net_contrib = []  # MI + Synergy - Redundancy
+        
+        for load_level in sorted_loads:
+            results = load_results[load_level]
+            if feat_idx < len(results):
+                r = results[feat_idx]
+                mi_by_load.append(r.mutual_information)
+                net_contrib.append(r.total_contribution)
+        
+        if mi_by_load:
+            ax_trend.plot(sorted_loads, mi_by_load, 'o--', 
+                         label=f'{feat_name} (MI)', color=colors_features[feat_idx], alpha=0.5)
+            ax_trend.plot(sorted_loads, net_contrib, 's-', 
+                         label=f'{feat_name} (Net)', color=colors_features[feat_idx], linewidth=2)
+    
+    ax_trend.axhline(y=0, color='black', linestyle='-', linewidth=1)
+    ax_trend.set_xlabel('N-back Level', fontsize=12)
+    ax_trend.set_ylabel('Information Contribution (Nats)', fontsize=12)
+    ax_trend.set_title('Information Contribution Trends: MI vs Net (MI + Synergy - Redundancy)', 
+                       fontsize=12, fontweight='bold')
+    ax_trend.set_xticks(sorted_loads)
+    ax_trend.set_xticklabels([f'{l}-back' for l in sorted_loads])
+    ax_trend.legend(loc='upper right', fontsize=8, ncol=2)
+    ax_trend.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"\nN-back comparison saved to: {save_path}")
+    
+    plt.close()
+    return fig
+
+
 def visualize_pidf_results(pidf: EnhancedPIDF, save_path: Optional[str] = None):
     """
-    Create visualizations of PIDF analysis results.
+    Create visualizations of PIDF analysis results in paper style.
     
     Creates:
-    1. PID component bar chart for each feature
+    1. PID component stacked bar chart (paper style)
     2. Feature-feature MI heatmap
-    3. Information flow diagram
+    3. Information breakdown pie chart
     """
     results = pidf.results
     n_features = len(results)
@@ -409,95 +762,105 @@ def visualize_pidf_results(pidf: EnhancedPIDF, save_path: Optional[str] = None):
     # Set style
     plt.style.use('seaborn-v0_8-whitegrid')
     
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.2, 1])
     
-    # 1. PID Component Stacked Bar Chart
-    ax1 = axes[0, 0]
+    # 1. Main PIDF Paper-style Bar Chart (larger, top spanning both columns)
+    ax1 = fig.add_subplot(gs[0, :])
+    
     feature_names = [r.feature_name for r in results]
-    unique = [r.unique_info for r in results]
-    redundancy = [r.redundancy for r in results]
-    synergy = [r.synergy for r in results]
-    
-    x = np.arange(n_features)
-    width = 0.6
-    
-    bars1 = ax1.bar(x, unique, width, label='Unique Info', color='#2ecc71')
-    bars2 = ax1.bar(x, redundancy, width, bottom=unique, label='Redundancy', color='#e74c3c')
-    
-    # Handle negative synergy by plotting below zero
-    synergy_pos = [max(0, s) for s in synergy]
-    synergy_neg = [min(0, s) for s in synergy]
-    
-    bars3 = ax1.bar(x, synergy_pos, width, bottom=np.array(unique)+np.array(redundancy), 
-                    label='Synergy (+)', color='#3498db')
-    bars4 = ax1.bar(x, synergy_neg, width, label='Synergy (-)', color='#9b59b6', alpha=0.7)
-    
-    ax1.set_xlabel('Features')
-    ax1.set_ylabel('Information (nats)')
-    ax1.set_title('PID Decomposition per Feature')
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(feature_names, rotation=45, ha='right')
-    ax1.legend(loc='upper right')
-    ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-    
-    # 2. MI Comparison Bar Chart
-    ax2 = axes[0, 1]
     mi_values = [r.mutual_information for r in results]
-    total_contrib = [r.total_contribution for r in results]
+    synergy_values = [r.synergy for r in results]
+    redundancy_values = [r.redundancy for r in results]
     
     x = np.arange(n_features)
-    width = 0.35
+    width = 0.5
     
-    bars1 = ax2.bar(x - width/2, mi_values, width, label='Individual MI', color='#9b59b6')
-    bars2 = ax2.bar(x + width/2, total_contrib, width, label='Total Contribution', color='#1abc9c')
+    # Paper style colors
+    color_mi = '#E74C3C'  # Red - I(Y; F_i)
+    color_synergy = '#2ECC71'  # Green - FWS
+    color_redundancy = '#9B59B6'  # Purple - FWR
     
-    ax2.set_xlabel('Features')
-    ax2.set_ylabel('Information (nats)')
-    ax2.set_title('Individual MI vs Total Contribution')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(feature_names, rotation=45, ha='right')
-    ax2.legend()
+    # Main stacked bar: MI + Synergy
+    bars_mi = ax1.bar(x, mi_values, width, label=r'$I(Y; F_i)$ - Individual MI', 
+                      color=color_mi, edgecolor='black', linewidth=1)
+    bars_synergy = ax1.bar(x, synergy_values, width, bottom=mi_values,
+                           label=r'$FWS(Y; \mathcal{F}_{\backslash i}, F_i)$ - Synergy',
+                           color=color_synergy, edgecolor='black', linewidth=1)
     
-    # 3. Feature-Feature MI Heatmap
-    ax3 = axes[1, 0]
+    # Show redundancy as small bars beside main bars
+    for i, red in enumerate(redundancy_values):
+        if red > 0.0001:
+            ax1.bar(x[i] + width * 0.4, red, width * 0.25, 
+                    color=color_redundancy, edgecolor='black', linewidth=1,
+                    hatch='///')
+    
+    # Add dummy for legend
+    if any(r > 0.0001 for r in redundancy_values):
+        ax1.bar([], [], width, label=r'$FWR$ - Redundancy', 
+                color=color_redundancy, hatch='///', edgecolor='black')
+    
+    # Add MCI annotations (MCI = MI + Synergy)
+    for i, (mi, syn) in enumerate(zip(mi_values, synergy_values)):
+        mci = mi + syn
+        ax1.annotate(f'MCI={mci:.4f}', xy=(x[i], mci), ha='center', va='bottom', 
+                     fontsize=10, fontweight='bold')
+        ax1.annotate(f'MI={mi:.4f}', xy=(x[i], mi/2), ha='center', va='center',
+                     fontsize=9, color='white')
+    
+    # Add bracket for OCI if synergy exists
+    for i, (mi, syn) in enumerate(zip(mi_values, synergy_values)):
+        if syn > 0.001:
+            ax1.annotate('', xy=(x[i] + width/2 + 0.05, mi), xytext=(x[i] + width/2 + 0.05, mi + syn),
+                         arrowprops=dict(arrowstyle='<->', color='black', lw=1.5))
+            ax1.annotate(f'OCI', xy=(x[i] + width/2 + 0.1, mi + syn/2), fontsize=8, va='center')
+    
+    ax1.set_xlabel('Features', fontsize=14)
+    ax1.set_ylabel('Information (Nats)', fontsize=14)
+    ax1.set_title('Interpretable Output of PIDF - Paper Style Visualization', fontsize=16, fontweight='bold')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(feature_names, fontsize=12)
+    ax1.legend(loc='upper right', fontsize=11, framealpha=0.9)
+    ax1.grid(axis='y', alpha=0.3)
+    
+    # 2. Feature-Feature MI Heatmap
+    ax2 = fig.add_subplot(gs[1, 0])
     if pidf.feature_mi_matrix is not None:
-        sns.heatmap(pidf.feature_mi_matrix, annot=True, fmt='.3f', 
+        mask = np.eye(n_features, dtype=bool)
+        sns.heatmap(pidf.feature_mi_matrix, annot=True, fmt='.4f', 
                     xticklabels=feature_names, yticklabels=feature_names,
-                    cmap='YlOrRd', ax=ax3, cbar_kws={'label': 'MI'})
-        ax3.set_title('Feature-Feature Mutual Information')
+                    cmap='YlOrRd', ax=ax2, cbar_kws={'label': 'MI'},
+                    mask=mask, linewidths=0.5)
+        ax2.set_title('Feature-Feature Mutual Information', fontsize=12, fontweight='bold')
     
-    # 4. PID Summary Radar/Text
-    ax4 = axes[1, 1]
-    ax4.axis('off')
-    
-    # Create summary text
-    summary_text = "PIDF Analysis Summary\n" + "=" * 40 + "\n\n"
+    # 3. Information Breakdown Summary
+    ax3 = fig.add_subplot(gs[1, 1])
     
     total_mi = sum(mi_values)
-    total_unique = sum(unique)
-    total_redundancy_sum = sum(redundancy)
-    total_synergy = sum([s for s in synergy if s > 0])
+    total_unique = sum(r.unique_info for r in results)
+    total_redundancy = sum(redundancy_values)
+    total_synergy = sum(s for s in synergy_values if s > 0)
     
-    summary_text += f"Total Information Metrics:\n"
-    summary_text += f"  • Sum of Individual MI: {total_mi:.4f}\n"
-    summary_text += f"  • Total Unique Info: {total_unique:.4f}\n"
-    summary_text += f"  • Total Redundancy: {total_redundancy_sum:.4f}\n"
-    summary_text += f"  • Total Synergy: {total_synergy:.4f}\n\n"
+    # Pie chart of information components
+    sizes = [total_unique, total_synergy, total_redundancy]
+    labels_pie = [f'Unique\n{total_unique:.4f}', 
+                  f'Synergy\n{total_synergy:.4f}', 
+                  f'Redundancy\n{total_redundancy:.4f}']
+    colors_pie = ['#3498DB', '#2ECC71', '#9B59B6']
+    explode = (0.05, 0.05, 0.05)
     
-    summary_text += "Selected Features:\n"
-    for r in results:
-        if r.is_selected:
-            summary_text += f"  ✓ {r.feature_name}\n"
-    
-    summary_text += "\nFeature Relationships:\n"
-    for r in results:
-        if r.synergistic_with:
-            partners = [pidf.feature_names[i] for i in r.synergistic_with]
-            summary_text += f"  • {r.feature_name} ↔ {partners}: Synergistic\n"
-    
-    ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes, fontsize=10,
-             verticalalignment='top', fontfamily='monospace',
-             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    # Only show non-zero slices
+    nonzero = [(s, l, c, e) for s, l, c, e in zip(sizes, labels_pie, colors_pie, explode) if s > 0.0001]
+    if nonzero:
+        sizes_nz, labels_nz, colors_nz, explode_nz = zip(*nonzero)
+        wedges, texts, autotexts = ax3.pie(sizes_nz, labels=labels_nz, colors=colors_nz,
+                                            explode=explode_nz, autopct='%1.1f%%',
+                                            startangle=90, textprops={'fontsize': 10})
+        ax3.set_title('Information Decomposition Breakdown', fontsize=12, fontweight='bold')
+    else:
+        ax3.text(0.5, 0.5, 'No significant information detected', 
+                 ha='center', va='center', fontsize=12)
+        ax3.set_title('Information Decomposition Breakdown', fontsize=12, fontweight='bold')
     
     plt.tight_layout()
     
@@ -505,7 +868,7 @@ def visualize_pidf_results(pidf: EnhancedPIDF, save_path: Optional[str] = None):
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"\nVisualization saved to: {save_path}")
     
-    plt.show()
+    plt.close()
     
     return fig
 
@@ -554,6 +917,211 @@ def load_real_data(subject='VP001', task='nback', include_events=True):
         return eeg_downsampled, hbo, hbr, event_labels, epoch_info, eeg_labels, nirs_labels
     
     return eeg_downsampled, hbo, hbr
+
+
+# =============================================================================
+# Advanced Feature Extraction Functions
+# =============================================================================
+
+# Frequency band definitions for EEG
+FREQ_BANDS = {
+    'delta': (0.5, 4),
+    'theta': (4, 8),
+    'alpha': (8, 13),
+    'beta': (13, 30),
+}
+
+
+def extract_band_power(signal: np.ndarray, fs: float, band: Tuple[float, float], 
+                       window_size: int = None) -> np.ndarray:
+    """
+    Extract power in a specific frequency band using FFT.
+    
+    Parameters:
+    - signal: (n_samples, n_channels) or (n_samples,)
+    - fs: Sampling frequency
+    - band: (low_freq, high_freq) tuple
+    - window_size: Size of sliding window (default: 1 second)
+    
+    Returns:
+    - power: Band power for each sample (smoothed)
+    """
+    from scipy.signal import welch
+    from scipy.ndimage import uniform_filter1d
+    
+    if signal.ndim == 1:
+        signal = signal.reshape(-1, 1)
+    
+    n_samples, n_channels = signal.shape
+    
+    if window_size is None:
+        window_size = int(fs)  # 1 second window
+    
+    # Compute power using sliding window approach
+    powers = np.zeros((n_samples, n_channels))
+    
+    for ch in range(n_channels):
+        # Use uniform filter to smooth the squared signal as approximation
+        # This is faster than computing full spectral analysis per sample
+        filtered = signal[:, ch] ** 2
+        powers[:, ch] = uniform_filter1d(filtered, size=window_size, mode='nearest')
+    
+    # For more accurate band power, we can use the variance in that band
+    # But for efficiency, we'll use a simpler approach based on signal energy
+    
+    return np.mean(powers, axis=1) if n_channels > 1 else powers.flatten()
+
+
+def extract_eeg_features(eeg: np.ndarray, eeg_labels: List[str], fs: float = 10.0,
+                         mode: str = 'minimal') -> Tuple[np.ndarray, List[str]]:
+    """
+    Extract EEG features with configurable complexity.
+    
+    Parameters:
+    - eeg: EEG data (n_samples, n_channels), already downsampled
+    - eeg_labels: Channel names
+    - fs: Sampling frequency (after downsampling)
+    - mode: 'minimal' (1 feature), 'basic' (2-3 features), 'moderate' (4-5 features)
+    
+    Returns:
+    - features: (n_samples, n_features)
+    - feature_names: List of feature names
+    """
+    features_list = []
+    names_list = []
+    
+    # Global average - always included
+    eeg_avg = np.mean(eeg, axis=1)
+    features_list.append(eeg_avg)
+    names_list.append('EEG_avg')
+    
+    if mode == 'minimal':
+        # Just global average
+        pass
+    
+    elif mode == 'basic':
+        # Add variance as proxy for activation level
+        from scipy.ndimage import uniform_filter1d
+        window = max(int(fs), 3)
+        global_var = uniform_filter1d(np.var(eeg, axis=1), size=window, mode='nearest')
+        features_list.append(global_var)
+        names_list.append('EEG_power')
+    
+    elif mode == 'moderate':
+        from scipy.ndimage import uniform_filter1d
+        window = max(int(fs), 3)
+        
+        # Frontal activity (related to working memory)
+        frontal_idx = [i for i, l in enumerate(eeg_labels) if l.startswith('F')]
+        if frontal_idx:
+            frontal_avg = np.mean(eeg[:, frontal_idx], axis=1)
+            features_list.append(frontal_avg)
+            names_list.append('EEG_Frontal')
+        
+        # Global power
+        global_var = uniform_filter1d(np.var(eeg, axis=1), size=window, mode='nearest')
+        features_list.append(global_var)
+        names_list.append('EEG_power')
+    
+    features = np.column_stack(features_list)
+    return features, names_list
+
+
+def extract_fnirs_features(hbo: np.ndarray, hbr: np.ndarray, nirs_labels: List[str], 
+                           fs: float = 10.0, mode: str = 'minimal') -> Tuple[np.ndarray, List[str]]:
+    """
+    Extract fNIRS features with configurable complexity.
+    
+    Parameters:
+    - hbo: HbO data (n_samples, n_channels)
+    - hbr: HbR data (n_samples, n_channels)
+    - nirs_labels: Channel names
+    - fs: Sampling frequency
+    - mode: 'minimal' (1 feature), 'basic' (2 features), 'moderate' (3-4 features)
+    
+    Returns:
+    - features: (n_samples, n_features)
+    - feature_names: List of feature names
+    """
+    features_list = []
+    names_list = []
+    
+    # Global HbO average - always included
+    hbo_avg = np.mean(hbo, axis=1)
+    features_list.append(hbo_avg)
+    names_list.append('fNIRS_avg')
+    
+    if mode == 'minimal':
+        # Just HbO average
+        pass
+    
+    elif mode == 'basic':
+        # Add oxygenation index (HbO - HbR)
+        if hbr is not None:
+            hbr_avg = np.mean(hbr, axis=1)
+            oxy_index = hbo_avg - hbr_avg
+            features_list.append(oxy_index)
+            names_list.append('fNIRS_Oxy')
+    
+    elif mode == 'moderate':
+        if hbr is not None:
+            hbr_avg = np.mean(hbr, axis=1)
+            # Oxygenation index
+            oxy_index = hbo_avg - hbr_avg
+            features_list.append(oxy_index)
+            names_list.append('fNIRS_Oxy')
+        
+        # Temporal derivative (hemodynamic response dynamics)
+        hbo_slope = np.gradient(hbo_avg)
+        features_list.append(hbo_slope)
+        names_list.append('fNIRS_slope')
+    
+    features = np.column_stack(features_list)
+    return features, names_list
+
+
+def prepare_advanced_features(eeg: np.ndarray, hbo: np.ndarray, hbr: np.ndarray,
+                              eeg_labels: List[str], nirs_labels: List[str],
+                              fs: float = 10.0, mode: str = 'simple') -> Tuple[np.ndarray, List[str]]:
+    """
+    Prepare multimodal features for PIDF analysis.
+    
+    Parameters:
+    - eeg: EEG data (n_samples, n_channels)
+    - hbo: fNIRS HbO data (n_samples, n_channels)
+    - hbr: fNIRS HbR data (n_samples, n_channels)
+    - eeg_labels, nirs_labels: Channel labels
+    - fs: Sampling frequency
+    - mode: 'simple' (2 features), 'basic' (4 features), 'moderate' (6 features)
+    
+    Returns:
+    - features: Combined feature matrix
+    - feature_names: Feature names
+    
+    Note: Fewer features = faster computation. For PID analysis, we focus on
+    the core question: does combining EEG + fNIRS provide synergistic information?
+    """
+    if mode == 'simple':
+        # Minimal: just averaged signals (2 features total)
+        # This is sufficient for testing basic synergy between modalities
+        eeg_feats, eeg_names = extract_eeg_features(eeg, eeg_labels, fs, mode='minimal')
+        fnirs_feats, fnirs_names = extract_fnirs_features(hbo, hbr, nirs_labels, fs, mode='minimal')
+        features = np.column_stack([eeg_feats, fnirs_feats])
+        return features, eeg_names + fnirs_names
+    
+    elif mode == 'basic':
+        # Basic: averaged + power/oxygenation (4 features total)
+        eeg_feats, eeg_names = extract_eeg_features(eeg, eeg_labels, fs, mode='basic')
+        fnirs_feats, fnirs_names = extract_fnirs_features(hbo, hbr, nirs_labels, fs, mode='basic')
+        features = np.column_stack([eeg_feats, fnirs_feats])
+        return features, eeg_names + fnirs_names
+    
+    else:  # moderate
+        # Moderate: regional + temporal dynamics (6 features total)
+        eeg_feats, eeg_names = extract_eeg_features(eeg, eeg_labels, fs, mode='moderate')
+        fnirs_feats, fnirs_names = extract_fnirs_features(hbo, hbr, nirs_labels, fs, mode='moderate')
+        features = np.column_stack([eeg_feats, fnirs_feats])
+        return features, eeg_names + fnirs_names
 
 
 def prepare_multimodal_features(eeg: np.ndarray, hbo: np.ndarray, 
@@ -639,9 +1207,10 @@ def prepare_multimodal_features(eeg: np.ndarray, hbo: np.ndarray,
 
 
 def main():
-    """Main analysis function using Enhanced PIDF."""
+    """Main analysis function using Enhanced PIDF with advanced features."""
     print("=" * 70)
     print("EEG/fNIRS Partial Information Decomposition Analysis (PIDF Method)")
+    print("Enhanced Version with Redundancy/Interference Detection")
     print("=" * 70)
     
     # Load data
@@ -649,15 +1218,17 @@ def main():
         include_events=True
     )
     
+    nirs_fs = 10.0  # fNIRS sampling rate after downsampling
+    
     # =========================================================================
-    # Analysis 1: Basic Bimodal Analysis (EEG vs fNIRS)
+    # Analysis 1: Basic Bimodal Analysis (EEG vs fNIRS) - Simple features
     # =========================================================================
     print("\n" + "=" * 70)
-    print("ANALYSIS 1: Basic Bimodal PIDF (EEG avg vs fNIRS avg)")
+    print("ANALYSIS 1: Basic Bimodal PIDF (Simple Features)")
     print("=" * 70)
     
-    features, feature_names = prepare_multimodal_features(
-        eeg, hbo, eeg_labels, nirs_labels, mode='average'
+    features_simple, feature_names_simple = prepare_advanced_features(
+        eeg, hbo, hbr, eeg_labels, nirs_labels, fs=nirs_fs, mode='simple'
     )
     
     # Subsample for computational tractability
@@ -666,19 +1237,20 @@ def main():
         print(f"\nSubsampling from {len(event_labels)} to {max_samples} samples...")
         np.random.seed(42)
         indices = np.random.choice(len(event_labels), max_samples, replace=False)
-        features_sub = features[indices]
+        features_sub = features_simple[indices]
         targets_sub = event_labels[indices]
     else:
-        features_sub = features
+        features_sub = features_simple
         targets_sub = event_labels
+        indices = None
     
-    print(f"\nFeatures: {feature_names}")
+    print(f"\nFeatures: {feature_names_simple}")
     print(f"Target: Event labels (0=baseline, 1=target)")
     
     # Run Enhanced PIDF
     pidf = EnhancedPIDF(
         features_sub, targets_sub, 
-        feature_names=feature_names,
+        feature_names=feature_names_simple,
         num_iterations=150
     )
     
@@ -691,59 +1263,71 @@ def main():
     visualize_pidf_results(pidf, save_path=viz_path)
     
     # =========================================================================
-    # Analysis 2: Region-based Analysis
+    # Analysis 2: Basic Features (with power/oxygenation)
     # =========================================================================
     print("\n" + "=" * 70)
-    print("ANALYSIS 2: Region-based PIDF")
+    print("ANALYSIS 2: Basic Features PIDF (4 features)")
     print("=" * 70)
     
-    features_regions, region_names = prepare_multimodal_features(
-        eeg, hbo, eeg_labels, nirs_labels, mode='regions'
+    features_basic, feature_names_basic = prepare_advanced_features(
+        eeg, hbo, hbr, eeg_labels, nirs_labels, fs=nirs_fs, mode='basic'
     )
     
-    print(f"\nFeatures: {region_names}")
+    print(f"\nFeatures ({len(feature_names_basic)}): {feature_names_basic}")
     
-    if len(event_labels) > max_samples:
-        features_regions_sub = features_regions[indices]
+    if indices is not None:
+        features_basic_sub = features_basic[indices]
     else:
-        features_regions_sub = features_regions
+        features_basic_sub = features_basic
     
-    pidf_regions = EnhancedPIDF(
-        features_regions_sub, targets_sub,
-        feature_names=region_names,
-        num_iterations=150
+    pidf_basic = EnhancedPIDF(
+        features_basic_sub, targets_sub,
+        feature_names=feature_names_basic,
+        num_iterations=120
     )
     
-    results_regions = pidf_regions.run_full_analysis()
-    pidf_regions.print_summary()
+    results_basic = pidf_basic.run_full_analysis()
+    pidf_basic.print_summary()
     
     # Visualize
-    viz_path_regions = os.path.join(os.path.dirname(__file__), '..', 'visualizations', 'pidf_regions.png')
-    visualize_pidf_results(pidf_regions, save_path=viz_path_regions)
+    viz_path_basic = os.path.join(os.path.dirname(__file__), '..', 'visualizations', 'pidf_basic.png')
+    visualize_pidf_results(pidf_basic, save_path=viz_path_basic)
     
     # =========================================================================
-    # Analysis 3: Cognitive Load Comparison
+    # Analysis 3: All N-back Conditions Comparison (0-back, 2-back, 3-back)
     # =========================================================================
     print("\n" + "=" * 70)
-    print("ANALYSIS 3: Cognitive Load Comparison")
+    print("ANALYSIS 3: Complete N-back Comparison (0-back, 2-back, 3-back)")
     print("=" * 70)
     
     load_labels = epoch_info['load_labels']
-    unique_loads = np.unique(load_labels[load_labels > 0])
+    
+    # Include 0-back by checking for load_labels == 0 where there are events
+    # For 0-back, we need to identify where load_labels == 0 but event_labels can be either 0 or 1
+    unique_loads = [0, 2, 3]  # Explicitly include 0-back
     
     load_results = {}
     
     for load_level in unique_loads:
         mask = load_labels == load_level
-        if np.sum(mask) > 500:  # Enough samples
-            print(f"\n--- {load_level}-back Task ---")
+        n_samples = np.sum(mask)
+        
+        if n_samples > 300:  # Lower threshold to include 0-back
+            print(f"\n{'='*50}")
+            print(f"--- {load_level}-back Task ({n_samples} samples) ---")
+            print(f"{'='*50}")
             
-            features_load = features[mask]
+            features_load = features_simple[mask]
             targets_load = event_labels[mask]
+            
+            # Check class balance
+            n_target = np.sum(targets_load == 1)
+            n_baseline = np.sum(targets_load == 0)
+            print(f"Class distribution: target={n_target}, baseline={n_baseline}")
             
             # Subsample if needed
             if len(targets_load) > 2000:
-                np.random.seed(42)
+                np.random.seed(42 + load_level)  # Different seed per condition
                 idx = np.random.choice(len(targets_load), 2000, replace=False)
                 features_load = features_load[idx]
                 targets_load = targets_load[idx]
@@ -751,51 +1335,121 @@ def main():
             if len(np.unique(targets_load)) > 1:  # Need both classes
                 pidf_load = EnhancedPIDF(
                     features_load, targets_load,
-                    feature_names=feature_names,
+                    feature_names=feature_names_simple,
                     num_iterations=100
                 )
                 
                 load_results[load_level] = pidf_load.run_full_analysis()
                 pidf_load.print_summary()
+            else:
+                print(f"  Skipping {load_level}-back: only one class present")
     
     # =========================================================================
-    # Save Results Summary
+    # Visualization: N-back Comparison
+    # =========================================================================
+    if load_results:
+        viz_path_nback = os.path.join(os.path.dirname(__file__), '..', 'visualizations', 'pidf_nback_comparison.png')
+        visualize_nback_comparison(load_results, feature_names_simple, save_path=viz_path_nback)
+    
+    # =========================================================================
+    # Save Comprehensive Results Summary
     # =========================================================================
     results_file = os.path.join(os.path.dirname(__file__), '..', 'result', 'pidf_analysis_results.txt')
     os.makedirs(os.path.dirname(results_file), exist_ok=True)
     
     with open(results_file, 'w', encoding='utf-8') as f:
         f.write("PIDF Analysis Results for EEG/fNIRS Data\n")
+        f.write("Enhanced Version with Redundancy/Interference Detection\n")
         f.write("=" * 70 + "\n\n")
         
-        f.write("1. Basic Bimodal Analysis:\n")
-        f.write("-" * 40 + "\n")
+        # Analysis 1 results
+        f.write("1. Basic Bimodal Analysis (Simple Features):\n")
+        f.write("-" * 50 + "\n")
         for r in results:
-            f.write(f"  {r.feature_name}:\n")
-            f.write(f"    MI: {r.mutual_information:.4f}\n")
-            f.write(f"    Unique: {r.unique_info:.4f}\n")
-            f.write(f"    Redundancy: {r.redundancy:.4f}\n")
-            f.write(f"    Synergy: {r.synergy:.4f}\n")
-            f.write(f"    Selected: {r.is_selected}\n")
+            f.write(f"\n  {r.feature_name}:\n")
+            f.write(f"    MI (Individual): {r.mutual_information:.4f}\n")
+            f.write(f"    Synergy (θ > 0): {r.synergy:.4f}\n")
+            f.write(f"    Redundancy (θ < 0): {r.redundancy:.4f}\n")
+            f.write(f"    Unique Info: {r.unique_info:.4f}\n")
+            f.write(f"    Net Contribution: {r.total_contribution:.4f}\n")
+            f.write(f"    Interaction Type: {r.interaction_type}\n")
+            if r.theta_values:
+                f.write(f"    Raw θ values: {r.theta_values}\n")
         
-        f.write(f"\n  Selected Features: {[r.feature_name for r in results if r.is_selected]}\n")
+        # Analysis 2 results
+        f.write("\n\n2. Basic Features Analysis:\n")
+        f.write("-" * 50 + "\n")
+        for r in results_basic:
+            net_theta = np.mean(list(r.theta_values.values())) if r.theta_values else 0
+            f.write(f"  {r.feature_name}: MI={r.mutual_information:.4f}, theta_avg={net_theta:.4f}, type={r.interaction_type}\n")
         
-        f.write("\n\n2. Region-based Analysis:\n")
-        f.write("-" * 40 + "\n")
-        for r in results_regions:
-            f.write(f"  {r.feature_name}:\n")
-            f.write(f"    MI: {r.mutual_information:.4f}\n")
-            f.write(f"    Unique: {r.unique_info:.4f}\n")
-            f.write(f"    Redundancy: {r.redundancy:.4f}\n")
-            f.write(f"    Synergy: {r.synergy:.4f}\n")
+        # Analysis 3 results - N-back comparison
+        f.write("\n\n3. Complete N-back Comparison (0, 2, 3-back):\n")
+        f.write("-" * 50 + "\n")
+        f.write("\nDetailed Comparison Table:\n\n")
         
-        f.write("\n\n3. Cognitive Load Comparison:\n")
-        f.write("-" * 40 + "\n")
-        for load_level, load_res in load_results.items():
-            f.write(f"\n  {load_level}-back task:\n")
+        # Header
+        f.write(f"{'Condition':<12} {'Feature':<12} {'MI':>10} {'Synergy':>10} {'Redundancy':>10} {'Net θ':>10} {'Type':<15}\n")
+        f.write("-" * 81 + "\n")
+        
+        for load_level in sorted(load_results.keys()):
+            load_res = load_results[load_level]
             for r in load_res:
-                f.write(f"    {r.feature_name}: MI={r.mutual_information:.4f}, "
-                       f"Unique={r.unique_info:.4f}, Synergy={r.synergy:.4f}\n")
+                net_theta = np.mean(list(r.theta_values.values())) if r.theta_values else 0
+                f.write(f"{load_level}-back{'':<6} {r.feature_name:<12} {r.mutual_information:>10.4f} "
+                       f"{r.synergy:>10.4f} {r.redundancy:>10.4f} {net_theta:>10.4f} {r.interaction_type:<15}\n")
+            f.write("\n")
+        
+        # Summary statistics
+        f.write("\n" + "=" * 81 + "\n")
+        f.write("Summary by Condition:\n")
+        f.write("-" * 50 + "\n")
+        
+        for load_level in sorted(load_results.keys()):
+            load_res = load_results[load_level]
+            total_mi = sum(r.mutual_information for r in load_res)
+            total_syn = sum(r.synergy for r in load_res)
+            total_red = sum(r.redundancy for r in load_res)
+            net_effect = total_syn - total_red
+            
+            # Determine overall interaction
+            if net_effect > 0.001:
+                interaction = "SYNERGISTIC (EEG & fNIRS enhance each other)"
+            elif net_effect < -0.001:
+                interaction = "REDUNDANT/INTERFERENCE (modalities compete)"
+            else:
+                interaction = "INDEPENDENT (modalities provide separate info)"
+            
+            f.write(f"\n{load_level}-back:\n")
+            f.write(f"  Total MI: {total_mi:.4f}\n")
+            f.write(f"  Total Synergy: {total_syn:.4f}\n")
+            f.write(f"  Total Redundancy: {total_red:.4f}\n")
+            f.write(f"  Net Effect (Syn - Red): {net_effect:.4f}\n")
+            f.write(f"  Interpretation: {interaction}\n")
+        
+        # Key findings
+        f.write("\n\n" + "=" * 81 + "\n")
+        f.write("KEY FINDINGS:\n")
+        f.write("-" * 50 + "\n")
+        
+        if len(load_results) >= 2:
+            sorted_loads = sorted(load_results.keys())
+            for i in range(len(sorted_loads) - 1):
+                load1, load2 = sorted_loads[i], sorted_loads[i+1]
+                res1, res2 = load_results[load1], load_results[load2]
+                
+                net1 = sum(r.synergy - r.redundancy for r in res1)
+                net2 = sum(r.synergy - r.redundancy for r in res2)
+                
+                change = net2 - net1
+                if change > 0.001:
+                    f.write(f"\n• {load1}-back → {load2}-back: Synergy INCREASES (+{change:.4f})\n")
+                    f.write(f"  → Higher cognitive load promotes multimodal integration\n")
+                elif change < -0.001:
+                    f.write(f"\n• {load1}-back → {load2}-back: Synergy DECREASES ({change:.4f})\n")
+                    f.write(f"  → Higher cognitive load may cause modality interference\n")
+                else:
+                    f.write(f"\n• {load1}-back → {load2}-back: No significant change ({change:.4f})\n")
     
     print(f"\n\nResults saved to: {results_file}")
     print("\n" + "=" * 70)

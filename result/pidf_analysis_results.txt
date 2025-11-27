@@ -1,0 +1,86 @@
+PIDF Analysis Results for EEG/fNIRS Data
+Enhanced Version with Redundancy/Interference Detection
+======================================================================
+
+1. Basic Bimodal Analysis (Simple Features):
+--------------------------------------------------
+
+  EEG_avg:
+    MI (Individual): 0.0099
+    Synergy (θ > 0): 0.0000
+    Redundancy (θ < 0): 0.0000
+    Unique Info: 0.0099
+    Net Contribution: 0.0099
+    Interaction Type: weakly_synergistic
+    Raw θ values: {1: 0.006470441818237305}
+
+  fNIRS_avg:
+    MI (Individual): 0.0072
+    Synergy (θ > 0): 0.0065
+    Redundancy (θ < 0): 0.0000
+    Unique Info: 0.0072
+    Net Contribution: 0.0137
+    Interaction Type: synergistic
+    Raw θ values: {0: 0.006456931432088216}
+
+
+2. Basic Features Analysis:
+--------------------------------------------------
+  EEG_avg: MI=0.0096, theta_avg=0.0011, type=weakly_synergistic
+  EEG_power: MI=0.0119, theta_avg=-0.0004, type=independent
+  fNIRS_avg: MI=0.0072, theta_avg=-0.0038, type=redundant
+  fNIRS_Oxy: MI=0.0011, theta_avg=-0.0004, type=independent
+
+
+3. Complete N-back Comparison (0, 2, 3-back):
+--------------------------------------------------
+
+Detailed Comparison Table:
+
+Condition    Feature              MI    Synergy Redundancy      Net θ Type           
+---------------------------------------------------------------------------------
+0-back       EEG_avg          0.0297     0.0000     0.0000     0.0016 weakly_synergistic
+0-back       fNIRS_avg        0.0160     0.0000     0.0000     0.0028 weakly_synergistic
+
+2-back       EEG_avg          0.0096     0.0150     0.0000     0.0150 synergistic    
+2-back       fNIRS_avg        0.0015     0.0108     0.0000     0.0108 synergistic    
+
+3-back       EEG_avg          0.0104     0.0000     0.0000     0.0002 independent    
+3-back       fNIRS_avg        0.0043     0.0000     0.0000     0.0019 weakly_synergistic
+
+
+=================================================================================
+Summary by Condition:
+--------------------------------------------------
+
+0-back:
+  Total MI: 0.0457
+  Total Synergy: 0.0000
+  Total Redundancy: 0.0000
+  Net Effect (Syn - Red): 0.0000
+  Interpretation: INDEPENDENT (modalities provide separate info)
+
+2-back:
+  Total MI: 0.0111
+  Total Synergy: 0.0258
+  Total Redundancy: 0.0000
+  Net Effect (Syn - Red): 0.0258
+  Interpretation: SYNERGISTIC (EEG & fNIRS enhance each other)
+
+3-back:
+  Total MI: 0.0147
+  Total Synergy: 0.0000
+  Total Redundancy: 0.0000
+  Net Effect (Syn - Red): 0.0000
+  Interpretation: INDEPENDENT (modalities provide separate info)
+
+
+=================================================================================
+KEY FINDINGS:
+--------------------------------------------------
+
+• 0-back → 2-back: Synergy INCREASES (+0.0258)
+  → Higher cognitive load promotes multimodal integration
+
+• 2-back → 3-back: Synergy DECREASES (-0.0258)
+  → Higher cognitive load may cause modality interference
